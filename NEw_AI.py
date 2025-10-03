@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-chat_gui_pro_tagged_full.py
+chat_gui_pro_tagged_full_tagged.py
 Tam versiya — Tag-aware, round-robin, AppData-based logo & DB, Tkinter GUI.
+Yeni: avtomatik tag inferrence, tag-summary yenilənməsi və tag-sualı yaratma.
 """
 import json
 import os
@@ -204,6 +205,40 @@ def compute_age_from_date_string(date_str):
     except Exception:
         return None, None
 
+# ---------- Tag summary & helpers ----------
+def _collect_answers_for_tag(db, tag):
+    """Return list of cavab values for entries with matching tag."""
+    return [it.get("cavab","") for it in db.get("suallar", []) if (it.get("tag") or "").strip().casefold() == (tag or "").strip().casefold()]
+
+def update_tag_summary(db, tag):
+    """
+    Create or update a DB entry whose 'sual' equals the tag name.
+    The 'cavab' will be concatenation of all answers in that tag and final marker '— Tag: <tag>'.
+    """
+    if not tag:
+        return
+    tag_norm = tag.strip()
+    answers = _collect_answers_for_tag(db, tag_norm)
+    if not answers:
+        summary = f"Bu tag üçün hələ cavab yoxdur. — Tag: {tag_norm}"
+    else:
+        # join with separators; ensure readable
+        joined = "\n\n---\n\n".join([a.strip() for a in answers if a.strip()])
+        summary = f"{joined}\n\n— Tag: {tag_norm}"
+    # find existing entry whose 'sual' equals tag_norm (case-insensitive)
+    for it in db.get("suallar", []):
+        if normalize_text(it.get("sual","")) == normalize_text(tag_norm):
+            it["cavab"] = summary
+            it["tag"] = tag_norm  # keep meta consistent
+            save_db(db)
+            return
+    # else append a new one
+    db.setdefault("suallar", []).append({"sual": tag_norm, "cavab": summary, "tag": tag_norm})
+    save_db(db)
+
+def _gather_tags_from_db(db):
+    return sorted({(it.get("tag") or "").strip() for it in db.get("suallar", []) if (it.get("tag") or "").strip()})
+
 # ---------- Tag-aware selection with round-robin ----------
 def select_answer(user_question, db, context=None, cutoff=0.6, active_tag=None, round_robin_store=None):
     qn = normalize_text(user_question)
@@ -239,13 +274,14 @@ def select_answer(user_question, db, context=None, cutoff=0.6, active_tag=None, 
         chosen_tag = None
         if context:
             for who, txt in reversed(context):
-                m = re.search(r"Tag[:=]\s*([A-Za-z0-9_-]+)", txt)
+                m = re.search(r"Tag[:=]\s*([A-Za-z0-9 _-]+)", txt)
                 if m:
-                    chosen_tag = m.group(1)
+                    chosen_tag = m.group(1).strip()
                     break
         if not chosen_tag:
             chosen_tag = "auto"
 
+    # 1) exact match within chosen_tag
     cands_tagged = filter_by_tag(candidates, None if chosen_tag == "auto" else chosen_tag)
     exact_tagged = answers_for_question(cands_tagged, user_question)
     if exact_tagged:
@@ -256,6 +292,7 @@ def select_answer(user_question, db, context=None, cutoff=0.6, active_tag=None, 
             round_robin_store[key] = (idx + 1) % len(exact_tagged)
         return exact_tagged[idx].get("cavab")
 
+    # 2) fuzzy within chosen_tag
     corpus_tagged = [it.get("sual","") for it in cands_tagged]
     if corpus_tagged:
         matches = fuzzy_best_matches(user_question, corpus_tagged, limit=5)
@@ -270,10 +307,12 @@ def select_answer(user_question, db, context=None, cutoff=0.6, active_tag=None, 
             if matched_entries:
                 return matched_entries[idx].get("cavab")
 
+    # 3) fallback: global exact
     for it in candidates:
         if normalize_text(it.get("sual","")) == qn:
             return it.get("cavab")
 
+    # 4) fallback: global fuzzy
     corpus = [it.get("sual","") for it in candidates]
     if corpus:
         matches = fuzzy_best_matches(user_question, corpus, limit=5)
@@ -302,6 +341,7 @@ class ChatGUI(tk.Tk):
         self.context_max = 8
         self.round_robin = {}
         self.active_tag = "auto"
+        self.tag_cutoff = 0.55  # threshold for inferring tag from user's question
         self._build_ui()
 
     def _build_ui(self):
@@ -362,7 +402,7 @@ class ChatGUI(tk.Tk):
         # Active tag combobox
         ttk.Label(right, text="Aktiv Tag:").pack(anchor="w", pady=(8,0))
         self.tag_var = tk.StringVar(value="auto")
-        tags_list = self._gather_tags()
+        tags_list = _gather_tags_from_db(self.db)
         self.tag_combo = ttk.Combobox(right, textvariable=self.tag_var, values=["auto"] + tags_list, state="readonly")
         self.tag_combo.pack(fill=tk.X)
         self.tag_combo.bind("<<ComboboxSelected>>", lambda e: self._on_tag_change())
@@ -418,11 +458,10 @@ class ChatGUI(tk.Tk):
 
     # Tag helpers
     def _gather_tags(self):
-        tags = sorted({(it.get("tag") or "").strip() for it in self.db.get("suallar", []) if (it.get("tag") or "").strip()})
-        return tags
+        return _gather_tags_from_db(self.db)
 
     def _refresh_tag_combo(self):
-        tags_list = self._gather_tags()
+        tags_list = _gather_tags_from_db(self.db)
         vals = ["auto"] + tags_list
         try:
             self.tag_combo['values'] = vals
@@ -472,17 +511,52 @@ class ChatGUI(tk.Tk):
         if len(self.context) > self.context_max:
             self.context.pop(0)
 
+    def _infer_tag_from_question(self, question):
+        """
+        Infer a tag by fuzzy matching the user's question against known tags.
+        Returns tag string if confident (>= self.tag_cutoff) else None.
+        """
+        tags = _gather_tags_from_db(self.db)
+        if not tags:
+            return None
+        matches = fuzzy_best_matches(question, tags, limit=3)
+        if not matches:
+            return None
+        best_tag, score = matches[0]
+        if score >= self.tag_cutoff:
+            return best_tag
+        return None
+
     def _send(self):
         q = self.entry_var.get().strip()
         if not q:
             return
+        # before logging, try to infer tag from question or from previous user question
+        inferred = self._infer_tag_from_question(q)
+        if not inferred and self.context:
+            # try previous user message if exists
+            for who, txt in reversed(self.context):
+                if who == "Siz":
+                    inferred = self._infer_tag_from_question(txt)
+                    break
+        if inferred:
+            # update active tag for this session automatically
+            self.active_tag = inferred
+            try:
+                self.tag_var.set(inferred)
+            except Exception:
+                pass
+            self.status.set(f"Aktiv tag avtomatik seçildi: {inferred}")
+
         self._log("Siz", q)
         self.entry_var.set("")
         ans = select_answer(q, self.db, context=self.context, cutoff=self.cut.get(), active_tag=self.active_tag, round_robin_store=self.round_robin)
         if ans:
+            # If the answer is actually a tag-summary (sual==tag), mark in output
             self._log("Simfut", ans)
             self.status.set("Cavab tapıldı.")
             return
+        # show fuzzy candidates in list for manual pick
         corpus = [it.get("sual","") for it in self.db.get("suallar", [])]
         matches = fuzzy_best_matches(q, corpus, limit=5)
         self.match_list.delete(0, tk.END)
@@ -495,6 +569,7 @@ class ChatGUI(tk.Tk):
                     self._log("Simfut (təklif)", it.get("cavab"))
                     self.status.set(f"Təklif göstərildi (uyğunluq {matches[0][1]:.2f}).")
                     return
+        # else ask to teach
         self.status.set("Yeni sual — öyrətmək üçün pəncərə açılır.")
         self._teach_dialog(q)
 
@@ -516,19 +591,29 @@ class ChatGUI(tk.Tk):
             self._log("Simfut", "Öyrədilmədi.")
             return
         normalized = normalize_text(question)
+        # if duplicate exact normalized question exists, offer overwrite (handled in TeachDialog caller)
         for it in self.db.get("suallar", []):
             if normalize_text(it.get("sual","")) == normalized:
                 if not messagebox.askyesno("Duplicate", "Belə bir sual artıq var. Üzərinə yazılsın?"):
                     return
                 it.update({"cavab": td.result["cavab"], "tag": td.result.get("tag","")})
                 save_db(self.db)
+                # update tag summary if tag present
+                tag_val = td.result.get("tag","").strip()
+                if tag_val:
+                    update_tag_summary(self.db, tag_val)
                 self._log("Simfut", "Mövcud sual yeniləndi.")
                 if td.result.get("send_now"):
                     self._log("Simfut (yeni)", td.result["cavab"])
                 self._refresh_tag_combo()
                 return
-        self.db.setdefault("suallar", []).append({"sual": question, "cavab": td.result["cavab"], "tag": td.result.get("tag","")})
+        # add new entry
+        new_tag = td.result.get("tag","").strip()
+        self.db.setdefault("suallar", []).append({"sual": question, "cavab": td.result["cavab"], "tag": new_tag})
         save_db(self.db)
+        # update tag summary automatically
+        if new_tag:
+            update_tag_summary(self.db, new_tag)
         self._log("Simfut", "Yeni sual əlavə edildi.")
         if td.result.get("send_now"):
             self._log("Simfut (yeni)", td.result["cavab"])
@@ -654,13 +739,22 @@ class ManageDialog(tk.Toplevel):
         if a is None: return
         tag = simpledialog.askstring("Tag", "Tag (isteğe bağlı):", initialvalue="")
         self.db.setdefault("suallar", []).append({"sual": q, "cavab": a, "tag": tag or ""})
+        # if tag present, update summary
+        if tag:
+            update_tag_summary(self.db, tag)
         self._refresh()
 
     def _delete(self):
         sel = self.lb.curselection()
         if not sel: return
         if messagebox.askyesno("Silmək", "Silmək istədiyinizə əminsiniz?"):
+            # capture tag of deleted item to update summary later
+            tag_of = self.db["suallar"][sel[0]].get("tag","")
             del self.db["suallar"][sel[0]]
+            save_db(self.db)
+            # update tag summary if needed
+            if tag_of:
+                update_tag_summary(self.db, tag_of)
             self._refresh()
             self.preview.configure(state="normal"); self.preview.delete("1.0", tk.END); self.preview.configure(state="disabled")
 
